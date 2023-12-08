@@ -3,6 +3,9 @@
 from bcc import BPF
 import argparse
 import os
+from collections import defaultdict
+from bcc.utils import printb
+
 
 bpf_text = """
     #include <linux/fs.h>
@@ -14,17 +17,21 @@ bpf_text = """
     #define MAX_ENTRIES 32
 
     struct data_t {
+        u64 id;
         u32 uid;
         u32 pid;
         char comm[50];
         char name[200];
-        char dir[200];
+        char dir[100];
         int match;
+        int file_flag;
+        int end_flag;
     };
 
     BPF_PERF_OUTPUT(events);
 
     LSM_PROBE(file_open, struct file *file) {
+
 
         struct data_t data = {};
         struct dentry *dentry;
@@ -39,9 +46,14 @@ bpf_text = """
         u32 tid = tid_pid;
         u32 uid = bpf_get_current_uid_gid();
 
+        data.id = tid_pid;
         data.pid = pid;
         data.uid = uid;
+        data.end_flag = 0;
         data.match = 1;
+        data.file_flag = 0;
+
+        bpf_probe_read_kernel(&data.name, sizeof(data.name), (void *)dentry->d_name.name);
 
         UID_FILTER
         PID_FILTER
@@ -51,6 +63,9 @@ bpf_text = """
     }
 """
 
+raw_filename = ''
+entries = defaultdict(list)
+
 class FileMonitor:
     def __init__(self, bpf_text):
         self.bpf_text = bpf_text
@@ -59,8 +74,27 @@ class FileMonitor:
 
     def print_event(self, cpu, data, size):
         event = self.b["events"].event(data)
-        print("[Deny!] pid:{}\tuid:{}\tcomm:{}".format(event.pid, event.uid, event.comm.decode(),))
-        print("-------------------------------------------------------------------------------")
+
+        if not event.file_flag:
+            if event.end_flag == 1 :
+                paths = entries[event.id]
+                paths.reverse()
+                filename = os.path.join(*paths).decode()
+                try:
+                    del(entries[event.id])
+                except Exception:
+                    pass
+                print("[Deny!] pid:{}  uid:{}  comm:{}  file:{}".format(event.pid, event.uid, event.comm.decode(),filename))
+                print("--"*35)
+            else:
+                entries[event.id].append(event.name)
+        else:
+            filename = raw_filename
+            print("[Deny!] pid:{}  uid:{}  comm:{}  file:{}".format(event.pid, event.uid, event.comm.decode(),filename))
+            print("--"*35)
+
+
+
 
     def run(self):
         while True:
@@ -89,18 +123,61 @@ if __name__ == "__main__":
 
     else:
         if args.uid:
-            bpf_text = bpf_text.replace('UID_FILTER',
-            'if (uid == %s) { events.perf_submit(ctx, &data, sizeof(data)); return -EPERM; }' % args.uid)
+            uid_text = """
+                if(data.uid == %s){
+                    if (data.name[0] != '/') {
+                    int i;
+                    for (i = 1; i < 10; i++) {
+
+                        bpf_probe_read_kernel(&data.name, sizeof(data.name), (void *)dentry->d_name.name);
+                        data.end_flag = 0;
+                        events.perf_submit(ctx, &data, sizeof(data));
+
+                        if (dentry == dentry->d_parent) {
+                            break;
+                        }
+
+                        dentry = dentry->d_parent;
+                    }
+                }
+                data.end_flag = 1;
+                events.perf_submit(ctx, &data, sizeof(data));
+                return -EPERM;
+            }
+            """ % args.uid
+            bpf_text = bpf_text.replace('UID_FILTER',uid_text)
         else:
             bpf_text = bpf_text.replace('UID_FILTER', '')
 
         if args.pid:
-            bpf_text = bpf_text.replace('PID_FILTER',
-            'if (pid == %s) { events.perf_submit(ctx, &data, sizeof(data)); return -EPERM; }' % args.pid)
+            pid_text = """
+                if(data.pid == %s){
+                    if (data.name[0] != '/') {
+                    int i;
+                    for (i = 1; i < 10; i++) {
+
+                        bpf_probe_read_kernel(&data.name, sizeof(data.name), (void *)dentry->d_name.name);
+                        data.end_flag = 0;
+                        events.perf_submit(ctx, &data, sizeof(data));
+
+                        if (dentry == dentry->d_parent) {
+                            break;
+                        }
+
+                        dentry = dentry->d_parent;
+                    }
+                }
+                data.end_flag = 1;
+                events.perf_submit(ctx, &data, sizeof(data));
+                return -EPERM;
+            }
+            """ % args.pid
+            bpf_text = bpf_text.replace('PID_FILTER',pid_text)
         else:
             bpf_text = bpf_text.replace('PID_FILTER', '')
 
         if args.file:
+            raw_filename = str(args.file)
             dir_path, file_name = os.path.split(str(args.file))
             parent_dir, current_dir = os.path.split(dir_path)
 
@@ -114,6 +191,8 @@ if __name__ == "__main__":
             dir_path = '"' + current_dir + '"'
 
             file_text = """
+
+
                 int target_file_length = FILELENGTH;
                 int target_dir_length = DIRLENGTH;
                 char target_filename[] = FILENAME;
@@ -154,6 +233,7 @@ if __name__ == "__main__":
                 }
 
                 if(data.match){
+                    data.file_flag = 1;
                     events.perf_submit(ctx, &data, sizeof(data));
                     return -EPERM;
                 }
