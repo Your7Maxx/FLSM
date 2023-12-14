@@ -12,6 +12,8 @@ bpf_text = """
     #include <linux/fs_struct.h>
     #include <linux/errno.h>
     #include <linux/path.h>
+    #include <uapi/linux/ptrace.h>
+    #include <linux/sched.h>
     #include <linux/dcache.h>
 
     #define MAX_ENTRIES 32
@@ -53,10 +55,12 @@ bpf_text = """
         data.match = 1;
         data.file_flag = 0;
 
+
         bpf_probe_read_kernel(&data.name, sizeof(data.name), (void *)dentry->d_name.name);
 
         UID_FILTER
         PID_FILTER
+        COMM_FILTER
         FILE_FILTER
 
         return 0;
@@ -94,8 +98,6 @@ class FileMonitor:
             print("--"*35)
 
 
-
-
     def run(self):
         while True:
             try:
@@ -108,14 +110,16 @@ if __name__ == "__main__":
     examples = """examples:
     ./filedetect -p 181                 # All files whose pid is 181 are blocked from opening
     ./filedetect -u 1000                # All files whose uid is 100 are blocked from opening
+    ./filedetect -n python              # All files whose comm is "python" are blocked from opening
     ./filedetect -f /path/to/file.test  # All files whose filename is /path/to/file.test are blocked from opening
 """
 
     parser = argparse.ArgumentParser(description="Use KRSI to customize blocking file operations.")
 
     parser.add_argument("-f", "--file", help="FILE to filter (e.g., /path/to/file.test)")
-    parser.add_argument("-u", "--uid", help="UID to filter (e.g., 0/1000)")
+    parser.add_argument("-u", "--uid", help="UID to filter (e.g., 0)")
     parser.add_argument("-p", "--pid", help="PID to filter (e.g., 123456)")
+    parser.add_argument("-n", "--comm", help="COMM to filter (e.g., python)")
     args = parser.parse_args()
 
     if not any(vars(args).values()):
@@ -176,6 +180,65 @@ if __name__ == "__main__":
         else:
             bpf_text = bpf_text.replace('PID_FILTER', '')
 
+
+        if args.comm:
+            comm_text = """
+
+                char target_Comm[] = target_comm;
+                int target_Len = target_len;
+                int flag=1;
+
+                int comm_len = 0;
+                for(comm_len; comm_len < sizeof(data.comm); comm_len++){
+                    if (data.comm[comm_len] == '\\0') break;
+                }
+
+                if(comm_len == target_Len){
+                    int i=0;
+                    for(i;i<comm_len;i++){
+                        if(data.comm[i] != target_Comm[i]){
+                            flag = 0;
+                            break;
+                        }
+                    }
+                }else{
+                    flag = 0;
+                }
+
+                if(flag){
+                    if (data.name[0] != '/') {
+                    int i;
+                    for (i = 1; i < 10; i++) {
+
+                        bpf_probe_read_kernel(&data.name, sizeof(data.name), (void *)dentry->d_name.name);
+                        data.end_flag = 0;
+                        events.perf_submit(ctx, &data, sizeof(data));
+
+                        if (dentry == dentry->d_parent) {
+                            break;
+                        }
+
+                        dentry = dentry->d_parent;
+                    }
+                }
+                    data.end_flag = 1;
+                    events.perf_submit(ctx, &data, sizeof(data));
+                    return -EPERM;
+                }
+            """
+            comm_name = str(args.comm)
+            comm_len = str(len(comm_name))
+            comm_name = '"' + comm_name + '"'
+
+            comm_text = comm_text.replace('target_comm',comm_name)
+            comm_text = comm_text.replace('target_len',comm_len)
+
+            bpf_text = bpf_text.replace('COMM_FILTER',comm_text)
+
+        else:
+            bpf_text = bpf_text.replace('COMM_FILTER', '')
+
+
         if args.file:
             raw_filename = str(args.file)
             dir_path, file_name = os.path.split(str(args.file))
@@ -191,7 +254,6 @@ if __name__ == "__main__":
             dir_path = '"' + current_dir + '"'
 
             file_text = """
-
 
                 int target_file_length = FILELENGTH;
                 int target_dir_length = DIRLENGTH;
@@ -238,6 +300,7 @@ if __name__ == "__main__":
                     return -EPERM;
                 }
             """
+
             file_text = file_text.replace('FILELENGTH', FILELENGTH)
             file_text = file_text.replace('DIRLENGTH', DIRLENGTH)
             file_text = file_text.replace('FILENAME', file_name)
